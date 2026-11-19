@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import html
+import random
 import requests
 from dotenv import load_dotenv
 
@@ -38,6 +40,9 @@ HEADERS = {
 REQUEST_TIMEOUT = 45
 MAX_OUTPUT_TOKENS = 4096
 
+# Stop the run after LeetCode returns a Cloudflare challenge.
+CLOUDFLARE_BLOCKED = False
+
 # =========================================================
 # AI PROVIDERS
 #
@@ -61,7 +66,7 @@ AI_PROVIDERS = [
         "name": "NVIDIA NIM",
         "key": NVIDIA_API_KEY,
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "model": "openai/gpt-oss-120b",
+        "model": "deepseek-ai/deepseek-v4-flash",
     },
     {
         "name": "Cerebras",
@@ -113,34 +118,48 @@ def create_session():
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    if LEETCODE_SESSION:
-        print("🍪 Using LEETCODE_SESSION cookie...")
-        session.cookies.set("LEETCODE_SESSION", LEETCODE_SESSION, domain="leetcode.com")
-        session.get("https://leetcode.com/", timeout=15)
-        csrf = session.cookies.get("csrftoken", "")
-        session.headers.update({"X-CSRFToken": csrf})
-        return session
+    if not LEETCODE_SESSION:
+        raise SystemExit("❌ LEETCODE_SESSION not found!")
 
-    raise SystemExit("❌ LEETCODE_SESSION not found!")
+    print("🍪 Using LEETCODE_SESSION cookie...")
+    session.cookies.set(
+        "LEETCODE_SESSION",
+        LEETCODE_SESSION,
+        domain=".leetcode.com",
+        path="/",
+    )
+
+    try:
+        response = session.get("https://leetcode.com/", timeout=REQUEST_TIMEOUT)
+        csrf = session.cookies.get("csrftoken", "")
+        if csrf:
+            session.headers["X-CSRFToken"] = csrf
+        if response.status_code >= 400:
+            print(f"⚠️ LeetCode homepage returned HTTP {response.status_code}")
+    except requests.RequestException as exc:
+        print(f"⚠️ LeetCode session initialization warning: {exc}")
+
+    return session
 
 
 def check_login(session):
-    resp = session.post(
-        "https://leetcode.com/graphql",
-        json={"query": "{ userStatus { username isSignedIn } }"},
-        timeout=10,
-    )
+    try:
+        resp = session.post(
+            "https://leetcode.com/graphql",
+            json={"query": "{ userStatus { username isSignedIn } }"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", {}).get("userStatus", {})
+        username = data.get("username", "")
+        signed_in = bool(data.get("isSignedIn", False))
+        print(f"👤 User: {username or '***'} | Signed in: {signed_in}")
+        if not signed_in:
+            raise SystemExit("❌ Cookie expired or login unavailable.")
+        return True
+    except requests.RequestException as exc:
+        raise SystemExit(f"❌ LeetCode login check failed: {exc}")
 
-    data = resp.json().get("data", {}).get("userStatus", {})
-    username = data.get("username", "")
-    signed_in = data.get("isSignedIn", False)
-
-    print(f"👤 User: {username} | Signed in: {signed_in}")
-
-    if not signed_in:
-        raise SystemExit("❌ Cookie expired! Email alert will be sent.")
-
-    return True
 
 # =========================================================
 # QUESTIONS
@@ -158,6 +177,7 @@ def get_daily_challenge(session):
                 difficulty
                 questionId
                 topicTags { name }
+                codeSnippets { lang langSlug code }
             }
         }
     }
@@ -172,8 +192,8 @@ def get_daily_challenge(session):
     return resp.json()["data"]["activeDailyCodingChallengeQuestion"]
 
 
-def get_easy_problems(session, count=3):
-    """Fetch first N unsolved Easy problems."""
+def get_practice_problems(session, count=3, exclude_slug=None):
+    """Fetch a random set of unsolved problems across Easy, Medium and Hard."""
     query = """
     query problemsetQuestionList(
         $categorySlug: String,
@@ -203,7 +223,8 @@ def get_easy_problems(session, count=3):
         "categorySlug": "",
         "limit": 100,
         "skip": 0,
-        "filters": {"difficulty": "EASY"},
+        # Empty filters means do not restrict difficulty.
+        "filters": {},
     }
 
     resp = session.post(
@@ -213,9 +234,39 @@ def get_easy_problems(session, count=3):
     )
     resp.raise_for_status()
 
-    questions = resp.json()["data"]["problemsetQuestionList"]["questions"]
-    unsolved = [q for q in questions if q.get("status") != "ac"]
-    return unsolved[:count]
+    payload = resp.json()
+    questions = (
+        payload.get("data", {})
+        .get("problemsetQuestionList", {})
+        .get("questions", [])
+    )
+
+    # Keep only valid, unsolved questions and exclude today's Daily Challenge.
+    unsolved = [
+        q for q in questions
+        if q.get("titleSlug")
+        and q.get("questionId")
+        and q.get("status") != "ac"
+        and q.get("titleSlug") != exclude_slug
+        and q.get("difficulty") in {"Easy", "Medium", "Hard"}
+    ]
+
+    # Randomize the candidates so the agent is not stuck on the first
+    # questions returned by LeetCode's default ordering.
+    random.shuffle(unsolved)
+
+    selected = unsolved[:count]
+    if len(selected) < count:
+        raise RuntimeError(
+            f"Only found {len(selected)} unsolved practice problems; "
+            f"needed {count}."
+        )
+
+    print(
+        "🎲 Selected practice difficulties: "
+        + ", ".join(q.get("difficulty", "Unknown") for q in selected)
+    )
+    return selected
 
 
 def get_problem_content(session, slug):
@@ -226,6 +277,7 @@ def get_problem_content(session, slug):
             title
             content
             topicTags { name }
+            codeSnippets { lang langSlug code }
         }
     }
     """
@@ -236,7 +288,11 @@ def get_problem_content(session, slug):
         timeout=15,
     )
     resp.raise_for_status()
-    return resp.json()["data"]["question"]
+    payload = resp.json()
+    question = (payload.get("data") or {}).get("question")
+    if not isinstance(question, dict):
+        return None
+    return question
 
 # =========================================================
 # COMMUNITY SOLUTION
@@ -245,112 +301,208 @@ def extract_python_code(text):
     if not text:
         return None
 
+    text = html.unescape(str(text))
     patterns = [
         r"```python3\s*(.*?)```",
         r"```python\s*(.*?)```",
         r"```py\s*(.*?)```",
     ]
-
     for pattern in patterns:
-        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
+        for match in re.findall(pattern, text, re.DOTALL | re.IGNORECASE):
+            code = match.strip()
+            if code:
+                return code
+
+    # Some solution articles store code in HTML rather than Markdown.
+    for match in re.findall(
+        r"<pre[^>]*>\s*<code[^>]*>(.*?)</code>\s*</pre>",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        code = html.unescape(re.sub(r"<[^>]+>", "", match)).strip()
+        if code:
+            return code
 
     return None
 
 
 def get_community_solutions(session, slug):
-    query = """
-    query communitySolutions(
-        $questionSlug: String!,
-        $skip: Int!,
-        $first: Int!,
-        $orderBy: TopicSortingOption,
-        $languageTags: [String!]
+    """Fetch Python solution articles using LeetCode's article GraphQL fields."""
+    articles_query = """
+    query questionSolutionArticles(
+        $questionSlug: String!, $skip: Int!, $first: Int!,
+        $orderBy: SolutionArticleOrderBy!
     ) {
-        questionSolutions(
-            filters: {
-                questionSlug: $questionSlug,
-                skip: $skip,
-                first: $first,
-                orderBy: $orderBy,
-                languageTags: $languageTags
-            }
+        questionSolutionArticles(
+            questionSlug: $questionSlug,
+            skip: $skip,
+            first: $first,
+            orderBy: $orderBy
         ) {
-            solutions {
-                id
-                title
-                content
-                langSlug
+            edges {
+                node {
+                    slug
+                    title
+                }
             }
         }
     }
     """
 
-    variables = {
-        "questionSlug": slug,
-        "skip": 0,
-        "first": 5,
-        "orderBy": "hot",
-        "languageTags": ["python3"],
-    }
-
     try:
-        resp = session.post(
+        response = session.post(
             "https://leetcode.com/graphql",
-            json={"query": query, "variables": variables},
-            timeout=15,
+            json={
+                "query": articles_query,
+                "variables": {
+                    "questionSlug": slug,
+                    "skip": 0,
+                    "first": 10,
+                    "orderBy": "DEFAULT",
+                },
+            },
+            timeout=REQUEST_TIMEOUT,
         )
-
-        if resp.status_code != 200:
-            print(f"⚠️ Community API failed: HTTP {resp.status_code}")
+        if response.status_code != 200:
+            print(
+                f"⚠️ Community article list failed: HTTP {response.status_code} | "
+                f"{response.text[:350].replace(chr(10), ' ')}"
+            )
             return None
 
-        payload = resp.json()
-        solutions = (
+        payload = response.json()
+        if payload.get("errors"):
+            print(f"⚠️ Community GraphQL errors: {payload['errors'][:2]}")
+            return None
+
+        edges = (
             payload.get("data", {})
-            .get("questionSolutions", {})
-            .get("solutions", [])
+            .get("questionSolutionArticles", {})
+            .get("edges", [])
         )
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        print(f"⚠️ Community API request failed: {exc}")
+        return None
 
-        for sol in solutions:
-            if sol.get("langSlug") != "python3":
+    detail_query = """
+    query solutionArticle($slug: String!, $orderBy: SolutionArticleOrderBy!) {
+        solutionArticle(slug: $slug, orderBy: $orderBy) {
+            title
+            content
+            langSlug
+        }
+    }
+    """
+
+    for edge in edges:
+        node = (edge or {}).get("node") or {}
+        article_slug = node.get("slug")
+        if not article_slug:
+            continue
+        try:
+            detail_response = session.post(
+                "https://leetcode.com/graphql",
+                json={
+                    "query": detail_query,
+                    "variables": {
+                        "slug": article_slug,
+                        "orderBy": "DEFAULT",
+                    },
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            if detail_response.status_code != 200:
                 continue
-
-            code = extract_python_code(sol.get("content", ""))
+            detail_payload = detail_response.json()
+            article = (
+                detail_payload.get("data", {}).get("solutionArticle") or {}
+            )
+            if article.get("langSlug") not in (None, "python3", "python"):
+                continue
+            code = extract_python_code(article.get("content"))
             if code:
+                print(f"✅ Found Python community article: {article.get('title') or node.get('title')}")
                 return code
-
-    except Exception as e:
-        print(f"⚠️ Community solution fetch failed: {e}")
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            print(f"⚠️ Community article detail failed: {exc}")
 
     return None
+
 
 # =========================================================
 # AI PROMPT / RESPONSE CLEANUP
 # =========================================================
-def build_prompt(title, content, tags):
-    tags_str = ", ".join(tags) if tags else ""
+def get_python_starter_code(question):
+    """Return LeetCode's official Python3 starter template, if available."""
+    snippets = (question or {}).get("codeSnippets") or []
+    for snippet in snippets:
+        lang_slug = (snippet.get("langSlug") or "").lower()
+        lang = (snippet.get("lang") or "").lower()
+        if lang_slug in {"python3", "python"} or lang in {"python3", "python"}:
+            return snippet.get("code") or ""
+    return ""
 
-    return f"""You are a world-class competitive programmer.
-Solve this LeetCode problem with a CORRECT Python3 solution.
+
+def get_required_method_name(starter_code):
+    """Extract the method name LeetCode's driver expects."""
+    if not starter_code:
+        return None
+    match = re.search(
+        r"^\s*def\s+([A-Za-z_]\w*)\s*\(",
+        starter_code,
+        re.MULTILINE,
+    )
+    return match.group(1) if match else None
+
+
+def solution_has_required_method(solution, required_method):
+    if not required_method:
+        return True
+    pattern = rf"^\s*def\s+{re.escape(required_method)}\s*\("
+    return re.search(pattern, solution or "", re.MULTILINE) is not None
+
+
+def build_prompt(title, content, tags, starter_code=""):
+    tags_str = ", ".join(tags) if tags else ""
+    required_method = get_required_method_name(starter_code)
+
+    if starter_code:
+        starter_section = (
+            "Official LeetCode Python3 starter code. Preserve its exact "
+            "class and method names:\n" + starter_code
+        )
+    else:
+        starter_section = (
+            "Official Python3 starter code was unavailable. Infer the "
+            "exact required LeetCode signature carefully."
+        )
+
+    method_rule = (
+        f"- REQUIRED method name: {required_method}. The Solution class "
+        f"MUST define this exact method name.\n"
+        if required_method else
+        "- Preserve the exact LeetCode method signature; do not invent or rename it.\n"
+    )
+
+    return f"""You are solving a LeetCode problem. Produce a correct Python3 submission.
 
 Problem: {title}
 Tags: {tags_str}
 
-Description:
+Problem statement:
 {content}
 
-RULES:
-- Return ONLY raw Python3 code.
-- No markdown.
-- No backticks.
-- No explanation.
-- Include all necessary imports.
-- Match the exact LeetCode function/class signature required by the problem.
-- Handle edge cases.
-- Prefer a correct efficient solution suitable for LeetCode constraints.
+{starter_section}
+
+STRICT REQUIREMENTS:
+- Return ONLY complete raw Python3 code. No Markdown fences or explanation.
+- Keep class Solution and preserve the exact method name and parameters from the official starter code.
+{method_rule}- Do not substitute a similarly named method (for example, minScore is NOT minimizeSum).
+- Include necessary imports.
+- Handle edge cases and use an efficient algorithm.
 """
+
+
 
 
 def clean_ai_code(text):
@@ -451,7 +603,7 @@ def call_ai_provider(provider, prompt):
         code = clean_ai_code(text)
 
         if not code:
-            print(f"❌ {name}: empty/invalid response")
+            print(f"❌ {name}: empty/invalid response shape: {str(data)[:350]}")
             return None
 
         print(f"✅ {name}: solution generated")
@@ -469,24 +621,35 @@ def call_ai_provider(provider, prompt):
     return None
 
 
-def get_solution_from_ai(title, content, tags):
-    prompt = build_prompt(title, content, tags)
+def get_solution_from_ai(title, content, tags, starter_code=''):
+    prompt = build_prompt(title, content, tags, starter_code)
+    required_method = get_required_method_name(starter_code)
 
     print("\n🔄 AI FALLBACK CHAIN START")
-
     configured = 0
 
     for provider in AI_PROVIDERS:
-        if provider.get("key") and provider.get("url"):
-            configured += 1
-            solution = call_ai_provider(provider, prompt)
-            if solution:
-                return solution, provider["name"]
+        if not provider.get("key") or not provider.get("url"):
+            continue
+
+        configured += 1
+        solution = call_ai_provider(provider, prompt)
+        if not solution:
+            continue
+
+        if not solution_has_required_method(solution, required_method):
+            print(
+                f"⚠️ {provider['name']} used the wrong method signature; "
+                f"expected {required_method}. Trying the next provider."
+            )
+            continue
+
+        return solution, provider["name"]
 
     if configured == 0:
         print("❌ No AI provider is configured.")
     else:
-        print("❌ All configured AI providers failed.")
+        print("❌ No provider returned a solution with the required method signature.")
 
     return None, None
 
@@ -494,6 +657,7 @@ def get_solution_from_ai(title, content, tags):
 # SUBMIT
 # =========================================================
 def submit_and_check(session, slug, question_id, solution):
+    global CLOUDFLARE_BLOCKED
     csrf = session.cookies.get("csrftoken", "")
     session.headers.update({
         "X-CSRFToken": csrf,
@@ -527,8 +691,9 @@ def submit_and_check(session, slug, question_id, solution):
             or "cloudflare" in resp.text.lower()
             or "challenges.cloudflare.com" in resp.text.lower()
         ):
+            CLOUDFLARE_BLOCKED = True
             print("🛑 LeetCode submission blocked by Cloudflare challenge.")
-            print("🛑 Stopping this problem to avoid wasting AI API calls.")
+            print("🛑 Stopping the entire run to avoid wasting AI API calls.")
             return "SUBMISSION_BLOCKED"
 
         return "SUBMISSION_ERROR"
@@ -586,7 +751,7 @@ def submit_and_check(session, slug, question_id, solution):
 # =========================================================
 # SOLVE ONE PROBLEM
 # =========================================================
-def solve_problem(session, title, slug, question_id, content, tags, label=""):
+def solve_problem(session, title, slug, question_id, content, tags, starter_code="", label=""):
     print(f"\n{'=' * 60}")
     print(f"📝 {label}: {title}")
     print(f"🔗 https://leetcode.com/problems/{slug}/")
@@ -597,6 +762,11 @@ def solve_problem(session, title, slug, question_id, content, tags, label=""):
     # -----------------------------------------------------
     print("👥 Checking community solution...")
     community = get_community_solutions(session, slug)
+
+    required_method = get_required_method_name(starter_code)
+    if community and not solution_has_required_method(community, required_method):
+        print(f"⚠️ Community code has the wrong method signature; expected {required_method}. Skipping it.")
+        community = None
 
     if community:
         print("🔍 Trying community solution...")
@@ -616,10 +786,14 @@ def solve_problem(session, title, slug, question_id, content, tags, label=""):
     # -----------------------------------------------------
     # 2. AI PROVIDER FALLBACK CHAIN
     # -----------------------------------------------------
-    solution, provider_name = get_solution_from_ai(title, content, tags)
+    solution, provider_name = get_solution_from_ai(title, content, tags, starter_code)
+
+    if solution and not solution_has_required_method(solution, required_method):
+        print(f"⚠️ {provider_name} returned the wrong method signature; expected {required_method}. Skipping submission.")
+        solution = None
 
     if not solution:
-        print(f"⚠️ Could not generate a solution: {title}")
+        print(f"⚠️ Could not generate a valid-signature solution: {title}")
         return False
 
     # First generated solution from the first working provider.
@@ -635,7 +809,7 @@ def solve_problem(session, title, slug, question_id, content, tags, label=""):
         return False
 
     # If the generated solution is wrong, try the remaining providers once.
-    prompt = build_prompt(title, content, tags)
+    prompt = build_prompt(title, content, tags, starter_code)
 
     passed_provider = False
     for provider in AI_PROVIDERS:
@@ -651,6 +825,9 @@ def solve_problem(session, title, slug, question_id, content, tags, label=""):
 
         solution = call_ai_provider(provider, prompt)
         if not solution:
+            continue
+        if not solution_has_required_method(solution, required_method):
+            print(f"⚠️ {provider['name']} returned the wrong method signature; expected {required_method}. Skipping submission.")
             continue
 
         result = submit_and_check(session, slug, question_id, solution)
@@ -670,7 +847,7 @@ def solve_problem(session, title, slug, question_id, content, tags, label=""):
 # =========================================================
 def run_agent():
     print("🚀 LeetCode Agent Starting...")
-    print("🎯 Target: 4 questions/day = 1 Daily + 3 Easy")
+    print("🎯 Target: 4 questions/day = 1 Daily + 3 random Easy/Medium/Hard")
     print("🔁 Flow: Community → AI providers → next provider → FAILED")
 
     session = create_session()
@@ -685,36 +862,61 @@ def run_agent():
     daily = get_daily_challenge(session)
     q = daily["question"]
 
-    content = re.sub(r"<[^<]+?>", " ", q["content"])
+    raw_daily_content = q.get("content") or ""
+    content = re.sub(r"<[^<]+?>", " ", raw_daily_content)
     content = re.sub(r"\s+", " ", content).strip()
-    tags = [t["name"] for t in q.get("topicTags", [])]
+    tags = [t.get("name", "") for t in q.get("topicTags", []) if t.get("name")]
 
     print(f"Problem: {q['title']} [{q['difficulty']}]")
 
-    daily_ok = solve_problem(
-        session,
-        q["title"],
-        q["titleSlug"],
-        q["questionId"],
-        content,
-        tags,
-        label="Daily Challenge",
-    )
+    if not content:
+        print("⚠️ Daily problem statement is empty. Skipping this problem safely.")
+        daily_ok = False
+    else:
+        daily_ok = solve_problem(
+            session,
+            q["title"],
+            q["titleSlug"],
+            q["questionId"],
+            content,
+            tags,
+            starter_code=get_python_starter_code(q),
+            label="Daily Challenge",
+        )
 
     results.append(("🔥 Daily Challenge", q["title"], q["difficulty"], daily_ok))
     time.sleep(10)
 
-    # -----------------------------------------------------
-    # PROBLEMS 2-4: 3 EASY PRACTICE QUESTIONS
-    # -----------------------------------------------------
-    print("\n📚 EASY PRACTICE PROBLEMS (3)")
-    easy_problems = get_easy_problems(session, count=3)
+    if CLOUDFLARE_BLOCKED:
+        print("🛑 Run stopped because LeetCode presented a Cloudflare challenge.")
+        return
 
-    for i, eq in enumerate(easy_problems, 1):
+    # -----------------------------------------------------
+    # PROBLEMS 2-4: 3 RANDOM PRACTICE QUESTIONS (EASY / MEDIUM / HARD)
+    # -----------------------------------------------------
+    print("\n📚 RANDOM PRACTICE PROBLEMS (3: EASY / MEDIUM / HARD)")
+    practice_problems = get_practice_problems(session, count=3, exclude_slug=q.get("titleSlug"))
+
+    for i, eq in enumerate(practice_problems, 1):
+        if CLOUDFLARE_BLOCKED:
+            print("🛑 Skipping remaining practice problems after Cloudflare challenge.")
+            break
+
         data = get_problem_content(session, eq["titleSlug"])
-        easy_content = re.sub(r"<[^<]+?>", " ", data["content"])
+        if not data:
+            print(f"⚠️ Could not fetch statement for {eq.get('title')}. Skipping.")
+            results.append((f"📘 Practice #{i}", eq.get("title", "Unknown"), eq.get("difficulty", "Unknown"), False))
+            continue
+
+        raw_content = data.get("content") or ""
+        easy_content = re.sub(r"<[^<]+?>", " ", raw_content)
         easy_content = re.sub(r"\s+", " ", easy_content).strip()
-        easy_tags = [t["name"] for t in data.get("topicTags", [])]
+        easy_tags = [t.get("name", "") for t in (data.get("topicTags") or []) if t.get("name")]
+
+        if not easy_content:
+            print(f"⚠️ Empty problem statement for {eq.get('title')}. Skipping.")
+            results.append((f"📘 Practice #{i}", eq.get("title", "Unknown"), eq.get("difficulty", "Unknown"), False))
+            continue
 
         ok = solve_problem(
             session,
@@ -723,10 +925,14 @@ def run_agent():
             eq["questionId"],
             easy_content,
             easy_tags,
-            label=f"Easy #{i}",
+            starter_code=get_python_starter_code(data),
+            label=f"Practice #{i}",
         )
 
-        results.append((f"📗 Easy #{i}", eq["title"], "Easy", ok))
+        results.append((f"📘 Practice #{i}", eq["title"], eq.get("difficulty", "Unknown"), ok))
+        if CLOUDFLARE_BLOCKED:
+            print("🛑 Ending workflow run after Cloudflare challenge.")
+            break
         time.sleep(10)
 
     # -----------------------------------------------------
